@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import { OpenAI, toFile } from 'openai';
-import cheerio from 'cheerio';
+import { load } from 'cheerio';;
 
 // ===== ENV =====
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -60,7 +60,7 @@ function addressedToMe(ctx) {
 async function fetchAndClean(url) {
   const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 12000 });
   const html = await res.text();
-  const $ = cheerio.load(html);
+  const $ = load(html);
   $('script,style,noscript').remove();
   let text = $('body').text().replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
   return text.slice(0, 60000);
