@@ -1,0 +1,16 @@
+{
+  "name": "gpt-telegram-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.57.0",
+    "telegraf": "^4.16.3"
+  }
+}
