@@ -79,7 +79,6 @@ async function botIsAdmin(chatId, tg) {
 }
 
 // ===== /linkchannel @канал_или_id =====
-// Привязать канал к пользователю для будущих публикаций /post
 bot.command('linkchannel', async (ctx) => {
   if (!ensurePrivate(ctx)) return;
   const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
@@ -106,7 +105,6 @@ bot.command('linkchannel', async (ctx) => {
 });
 
 // ===== /mychannels =====
-// Список привязанных каналов
 bot.command('mychannels', async (ctx) => {
   if (!ensurePrivate(ctx)) return;
   const rows = await getUserChannels(ctx.from.id);
@@ -118,7 +116,6 @@ bot.command('mychannels', async (ctx) => {
 });
 
 // ===== /unlinkchannel @канал_или_id =====
-// Отвязать канал от пользователя
 bot.command('unlinkchannel', async (ctx) => {
   if (!ensurePrivate(ctx)) return;
   const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
@@ -126,7 +123,6 @@ bot.command('unlinkchannel', async (ctx) => {
 
   try {
     const chat = await ctx.telegram.getChat(arg);
-    // удаляем связь из user_channels
     await dbQuery(`DELETE FROM user_channels WHERE user_id=$1 AND chat_id=$2`, [ctx.from.id, chat.id]);
     await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
   } catch (e) {
@@ -135,7 +131,6 @@ bot.command('unlinkchannel', async (ctx) => {
 });
 
 // ===== /digest @канал [N] =====
-// Дайджест последних N сообщений канала (берём из нашей таблицы messages, куда мы логируем channel_post)
 bot.command('digest', async (ctx) => {
   if (!ensurePrivate(ctx)) return;
 
@@ -149,7 +144,6 @@ bot.command('digest', async (ctx) => {
     const chat = await ctx.telegram.getChat(target);
     if (chat.type !== 'channel') return ctx.reply('Укажите именно канал: @username или ID.');
 
-    // забираем последние N сообщений канала из БД, которые бот видел как channel_post
     const { rows } = await dbQuery(
       `SELECT content, media_type FROM messages
          WHERE chat_id=$1 AND role='channel' AND deleted=FALSE
@@ -181,7 +175,6 @@ ${plain}`;
     await ctx.reply('Ошибка. Проверьте @канал и что бот добавлен в канал.');
   }
 });
-
 
 // ---------- DB (v2) ----------
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
@@ -248,14 +241,15 @@ export async function initSchema(){
       PRIMARY KEY(chat_id, message_id)
     );`);
 
+  // ✅ FIXED: без COALESCE в PK
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS reactions(
-      chat_id    BIGINT,
-      message_id BIGINT,
-      emoji      TEXT,
-      user_id    BIGINT,
+      chat_id    BIGINT NOT NULL,
+      message_id BIGINT NOT NULL,
+      emoji      TEXT   NOT NULL,
+      user_id    BIGINT NOT NULL DEFAULT 0,
       ts         BIGINT,
-      PRIMARY KEY(chat_id, message_id, emoji, COALESCE(user_id,0))
+      PRIMARY KEY(chat_id, message_id, emoji, user_id)
     );`);
 
   await dbQuery(`
@@ -353,13 +347,15 @@ export async function storeMessageV2({
     [chat_id, message_id, user_id, role, content, media_type, media_url, reply_to_message_id, thread_id, ts, extra]
   );
 }
-export async function storeReaction({ chat_id, message_id, emoji = '👍', user_id = null, ts = Math.floor(Date.now()/1000) }){
+export async function storeReaction({
+  chat_id, message_id, emoji = '👍', user_id = null, ts = Math.floor(Date.now()/1000)
+}){
   if (!pool) return;
   await dbQuery(
     `INSERT INTO reactions(chat_id, message_id, emoji, user_id, ts)
      VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT(chat_id, message_id, emoji, COALESCE(user_id,0)) DO NOTHING;`,
-    [chat_id, message_id, emoji, user_id, ts]
+     ON CONFLICT(chat_id, message_id, emoji, user_id) DO NOTHING;`,
+    [chat_id, message_id, emoji, (user_id ?? 0), ts]
   );
 }
 export async function logPost({ chat_id, message_id = null, user_id = null, text = '', status = 'sent', error = null }){
@@ -493,8 +489,6 @@ bot.command('summary', async (ctx)=>{
 });
 
 // ===== Handlers & helpers (Block B, unified) =====
-
-// подготовка ответа LLM (без отправки)
 async function makeLLMReply(ctx, userText){
   const mood = await sentiment(userText);
   const URL_RE = /https?:\/\/\S+/gi;
