@@ -58,6 +58,131 @@ function addressedToMe(ctx){
   return false;
 }
 
+// ===== helper: разрешаем команды только в ЛС =====
+function ensurePrivate(ctx) {
+  if (ctx.chat?.type !== 'private') {
+    ctx.reply('Эта команда работает только в личке. Напишите мне в ЛС.');
+    return false;
+  }
+  return true;
+}
+
+// ===== helper: проверка, что бот админ в канале =====
+async function botIsAdmin(chatId, tg) {
+  try {
+    const admins = await tg.getChatAdministrators(chatId);
+    const me = await tg.getMe();
+    return admins.some(a => a.user.id === me.id);
+  } catch (_) {
+    return false;
+  }
+}
+
+// ===== /linkchannel @канал_или_id =====
+// Привязать канал к пользователю для будущих публикаций /post
+bot.command('linkchannel', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Формат: /linkchannel @username_канала или числовой ID');
+
+  try {
+    const chat = await ctx.telegram.getChat(arg);
+    if (chat.type !== 'channel') {
+      return ctx.reply('Это не канал. Укажите @username или ID канала.');
+    }
+    const isAdmin = await botIsAdmin(chat.id, ctx.telegram);
+    if (!isAdmin) {
+      return ctx.reply('Я не админ в этом канале. Добавьте меня админом и повторите.');
+    }
+
+    await upsertChat(chat, { can_post: true });
+    await upsertUser(ctx.from);
+    await linkUserChannel(ctx.from.id, chat.id);
+
+    await ctx.reply(`Канал привязан: ${chat.title || chat.username || chat.id}\nТеперь можно: /post Текст поста`);
+  } catch (e) {
+    await ctx.reply('Не удалось найти канал или нет прав. Проверьте @username/ID и мои права администратора.');
+  }
+});
+
+// ===== /mychannels =====
+// Список привязанных каналов
+bot.command('mychannels', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  const rows = await getUserChannels(ctx.from.id);
+  if (!rows.length) return ctx.reply('Нет привязанных каналов. Используйте /linkchannel @канал');
+  const list = rows.map((r, i) =>
+    `${i+1}. ${r.title || r.username || r.chat_id}  ${r.bot_can_post ? '✅ постинг' : '⛔️'}`
+  ).join('\n');
+  await ctx.reply(`Ваши каналы:\n${list}`);
+});
+
+// ===== /unlinkchannel @канал_или_id =====
+// Отвязать канал от пользователя
+bot.command('unlinkchannel', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Формат: /unlinkchannel @username_канала или ID');
+
+  try {
+    const chat = await ctx.telegram.getChat(arg);
+    // удаляем связь из user_channels
+    await dbQuery(`DELETE FROM user_channels WHERE user_id=$1 AND chat_id=$2`, [ctx.from.id, chat.id]);
+    await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
+  } catch (e) {
+    await ctx.reply('Не нашёл канал. Проверьте аргумент.');
+  }
+});
+
+// ===== /digest @канал [N] =====
+// Дайджест последних N сообщений канала (берём из нашей таблицы messages, куда мы логируем channel_post)
+bot.command('digest', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+
+  const parts = (ctx.message.text || '').split(/\s+/).slice(1);
+  if (!parts.length) return ctx.reply('Формат: /digest @канал 50  (по умолчанию N=50)');
+
+  const target = parts[0];
+  const N = Math.max(5, Math.min(200, parseInt(parts[1] || '50', 10) || 50));
+
+  try {
+    const chat = await ctx.telegram.getChat(target);
+    if (chat.type !== 'channel') return ctx.reply('Укажите именно канал: @username или ID.');
+
+    // забираем последние N сообщений канала из БД, которые бот видел как channel_post
+    const { rows } = await dbQuery(
+      `SELECT content, media_type FROM messages
+         WHERE chat_id=$1 AND role='channel' AND deleted=FALSE
+         ORDER BY ts DESC LIMIT $2`,
+      [chat.id, N]
+    );
+
+    if (!rows?.length) {
+      return ctx.reply('В базе нет постов этого канала (добавьте бота в канал, чтобы он видел посты).');
+    }
+
+    const plain = rows
+      .map((r, i) => `${i+1}) [${r.media_type}] ${r.content || '(media)'}`)
+      .join('\n');
+
+    const prompt = `Сделай краткий дайджест канала. До 10 пунктов, по делу, без воды.
+Тексты постов (новые сверху):
+${plain}`;
+
+    const r = await openai.chat.completions.create({
+      model: LLM_MODEL,
+      temperature: 0.3,
+      max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    await ctx.reply(r.choices[0].message.content || '—', { disable_web_page_preview: true });
+  } catch (e) {
+    await ctx.reply('Ошибка. Проверьте @канал и что бот добавлен в канал.');
+  }
+});
+
+
 // ---------- DB (v2) ----------
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 
