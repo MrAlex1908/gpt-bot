@@ -535,10 +535,33 @@ async function sendPostToChannel(chatId, text, requestedByUserId){
   }
 }
 
+// ====== PATCHED reactions with fallback + logging ======
 async function reactToMessage(chat_id, message_id, emojis=['👍'], fromUserId=null){
-  const reaction = emojis.map(e => ({ type:'emoji', emoji:e }));
-  await bot.telegram.callApi('setMessageReaction', { chat_id, message_id, reaction });
-  for (const e of emojis) await storeReaction({ chat_id, message_id, emoji:e, user_id:fromUserId });
+  const reactionObjects = emojis.map(e => ({ type:'emoji', emoji:e }));
+
+  try {
+    await bot.telegram.callApi('setMessageReaction', {
+      chat_id,
+      message_id,
+      reaction: reactionObjects,
+      is_big: false
+    });
+  } catch (err1) {
+    console.error('setMessageReaction failed (v1 payload):', err1?.response?.description || err1?.message || err1);
+    try {
+      await bot.telegram.callApi('setMessageReaction', {
+        chat_id,
+        message_id,
+        reaction: emojis, // fallback to array of strings
+        is_big: false
+      });
+    } catch (err2) {
+      console.error('setMessageReaction failed (fallback payload):', err2?.response?.description || err2?.message || err2);
+      throw err2;
+    }
+  }
+
+  for (const e of emojis) await storeReaction({ chat_id, message_id, emoji:e, user_id:(fromUserId ?? 0) });
 }
 
 // ---------- TEXT ----------
@@ -721,10 +744,24 @@ bot.command('post', async (ctx)=>{
 });
 
 bot.command('react', async (ctx)=>{
-  const emo = (ctx.message.text || '').split(' ')[1] || '👍';
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const emo = parts[1] || '👍';
   const tgt = ctx.message?.reply_to_message;
   if (!tgt) return ctx.reply('Ответьте на сообщение командой: /react 👍');
-  try { await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id); } catch {}
+
+  try {
+    await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id);
+    await ctx.reply(`Поставил реакцию ${emo} ✅`, { reply_to_message_id: tgt.message_id });
+  } catch (e) {
+    const reason = (e?.response?.description || e?.message || '').toLowerCase();
+    if (reason.includes('not supported') || reason.includes('reaction')) {
+      return ctx.reply('Не удалось: кажется, в этом чате/канале выключены реакции или Telegram их здесь не поддерживает.');
+    }
+    if (reason.includes('not enough rights') || reason.includes('admin')) {
+      return ctx.reply('Не удалось: у меня нет прав. Сделай меня админом и включи реакции в настройках чата/канала.');
+    }
+    return ctx.reply('Не удалось поставить реакцию. Проверь, что реакции включены и у меня есть права.');
+  }
 });
 
 // ===== WEBHOOK & STARTUP =====
@@ -733,10 +770,32 @@ app.get('/', (_, res) => res.send('OK'));
 
 app.listen(PORT, async ()=>{
   console.log('HTTP server listening on port', PORT);
+  console.log('BOT BUILD:', '2025-10-05-reactions-v3'); // build-маячок
+
   await initSchema(); // создаст таблицы, если есть DATABASE_URL
+
   const url = `${PUBLIC_URL}${WEBHOOK_SECRET_PATH}`;
+
+  // сбрасываем старый вебхук (на случай смены URL)
+  try { await bot.telegram.deleteWebhook({ drop_pending_updates: false }); } catch {}
+
   await bot.telegram.setWebhook(url);
   const me = await bot.telegram.getMe();
   bot.options.username = me.username;
+
+  // обновим меню команд
+  await bot.telegram.setMyCommands([
+    { command: 'summary',       description: 'Дай краткое резюме чата' },
+    { command: 'setprofile',    description: 'Задать стиль ответов' },
+    { command: 'mode',          description: 'Выбрать режим ответа' },
+    { command: 'linkchannel',   description: 'Привязать канал к себе' },
+    { command: 'mychannels',    description: 'Мои привязанные каналы' },
+    { command: 'unlinkchannel', description: 'Отвязать канал' },
+    { command: 'post',          description: 'Опубликовать пост в канал' },
+    { command: 'digest',        description: 'Дайджест постов канала' },
+    { command: 'react',         description: 'Поставить реакцию по reply' },
+    { command: 'reset',         description: 'Очистить контекст диалога' }
+  ]);
+
   console.log(`Bot @${me.username} webhook set to ${url}`);
 });
