@@ -6,49 +6,40 @@ import { OpenAI, toFile } from 'openai';
 import { load } from 'cheerio';
 import { Pool } from 'pg';
 
-// ===== ENV =====
+// ============ ENV ============
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const LLM_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const ASR_MODEL = process.env.OPENAI_TRANSCRIBE || 'whisper-1';
 const PUBLIC_URL = process.env.PUBLIC_URL;
-const WEBHOOK_SECRET_PATH = (process.env.WEBHOOK_SECRET_PATH || '/bot').startsWith('/')
-  ? (process.env.WEBHOOK_SECRET_PATH || '/bot')
-  : `/${process.env.WEBHOOK_SECRET_PATH}`;
+const RAW_WEBHOOK = process.env.WEBHOOK_SECRET_PATH || '/bot';
+const WEBHOOK_SECRET_PATH = RAW_WEBHOOK.startsWith('/') ? RAW_WEBHOOK : `/${RAW_WEBHOOK}`;
 const PORT = Number(process.env.PORT || 8080);
+const DATABASE_URL = process.env.DATABASE_URL || null;
 
-if (!TG_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required');
+// Online search providers (optional)
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
+const SERPAPI_KEY   = process.env.SERPAPI_KEY   || '';
+const BING_API_KEY  = process.env.BING_API_KEY  || '';
+
+if (!TG_TOKEN)   throw new Error('TELEGRAM_BOT_TOKEN is required');
 if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY is required');
 if (!PUBLIC_URL) throw new Error('PUBLIC_URL is required for webhooks');
 
+// ============ INIT ============
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 const bot = new Telegraf(TG_TOKEN);
-
-// === ПАТЧ №1: глобальный перехват ошибок + обёртка ===
-bot.use(async (ctx, next) => {
-  try {
-    await next();
-  } catch (err) {
-    console.error('Middleware error:', err?.response?.description || err?.message || err, {
-      update: ctx.update
-    });
-  }
-});
-bot.catch((err, ctx) => {
-  console.error('Unhandled bot error:', err?.response?.description || err?.message || err, {
-    update: ctx.update
-  });
-});
-
 const app = express();
 app.use(express.json());
 
-// ===== оперативная память (RAM) =====
+// ============ RAM-Session ============
 const MAX_TURNS = 8;
 const sessions = new Map(); // `${chat_id}:${user_id}` -> [{role,content}]
-const chatLog  = new Map(); // chat_id -> [{role,content}] (для /summary)
+const chatLog  = new Map(); // chat_id -> [{role,content}]
 
-const BASE_SYSTEM = `Ты — лаконичный помощник. Пиши по делу, используй Markdown и краткие выводы. Если просят резюме чата — выделяй главные пункты и задачи.`;
+const BASE_SYSTEM =
+  `Ты — лаконичный помощник. Пиши по делу, используй Markdown и краткие выводы. ` +
+  `Если просят резюме чата — выделяй главные пункты и задачи.`;
 
 function getKey(ctx){ return `${ctx.chat.id}:${ctx.from.id}`; }
 function pushHistory(ctx, role, content){
@@ -67,41 +58,64 @@ function appendChatLog(ctx, role, content){
 }
 function addressedToMe(ctx){
   if (ctx.chat?.type === 'private') return true;
-  const text = ctx.message?.text || '';
+  const text = ctx.message?.text || ctx.message?.caption || '';
   const botUsername = ctx.me?.username || bot.options.username || '';
-  if (botUsername && text?.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) return true;
+  if (botUsername && text.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) return true;
   if (ctx.message?.reply_to_message?.from?.is_bot) return true;
   return false;
 }
-function ensurePrivate(ctx) {
-  if (ctx.chat?.type !== 'private') {
+function ensurePrivate(ctx){
+  if (ctx.chat?.type !== 'private'){
     ctx.reply('Эта команда работает только в личке. Напишите мне в ЛС.');
     return false;
   }
   return true;
 }
-async function botIsAdmin(chatId, tg) {
-  try {
+async function botIsAdmin(chatId, tg){
+  try{
     const admins = await tg.getChatAdministrators(chatId);
     const me = await tg.getMe();
     return admins.some(a => a.user.id === me.id);
-  } catch (_) {
-    return false;
-  }
+  }catch{ return false; }
 }
 
-// ---------- DB ----------
-const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
+// ============ HTTP helpers ============
+function abortableFetch(url, options={}, ms=15000){
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...options, signal: ctrl.signal }).finally(() => clearTimeout(id));
+}
+async function fetchText(url, ms=15000){
+  const r = await abortableFetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, ms);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.text();
+}
+async function fetchJson(url, ms=15000){
+  const r = await abortableFetch(url, {}, ms);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
+}
+async function fetchAndClean(url){
+  const html = await fetchText(url, 15000);
+  const $ = load(html);
+  $('script,style,noscript').remove();
+  let text = $('body').text().replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
+  return text.slice(0, 60000);
+}
 
-async function dbQuery(q, params = []){
+// ============ DB (v2) ============
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL }) : null;
+
+async function dbQuery(q, params=[]){
   if (!pool) return null;
   const c = await pool.connect();
   try { return await c.query(q, params); }
   finally { c.release(); }
 }
 
-export async function initSchema(){
+async function initSchema(){
   if (!pool) return;
+
   await dbQuery(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
 
   await dbQuery(`
@@ -115,7 +129,8 @@ export async function initSchema(){
       settings_json  JSONB DEFAULT '{}'::jsonb,
       created_at     TIMESTAMPTZ DEFAULT NOW(),
       updated_at     TIMESTAMPTZ DEFAULT NOW()
-    );`);
+    );
+  `);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS chats(
@@ -127,7 +142,8 @@ export async function initSchema(){
       bot_can_react  BOOLEAN DEFAULT TRUE,
       created_at     TIMESTAMPTZ DEFAULT NOW(),
       updated_at     TIMESTAMPTZ DEFAULT NOW()
-    );`);
+    );
+  `);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS user_channels(
@@ -135,36 +151,39 @@ export async function initSchema(){
       chat_id   BIGINT REFERENCES chats(chat_id) ON DELETE CASCADE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY(user_id, chat_id)
-    );`);
+    );
+  `);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS messages(
       chat_id             BIGINT NOT NULL,
       message_id          BIGINT NOT NULL,
       user_id             BIGINT,
-      role                TEXT,   -- user | assistant | channel | system
+      role                TEXT,
       content             TEXT,
-      media_type          TEXT,   -- text | photo | voice | video_note | ...
+      media_type          TEXT,
       media_url           TEXT,
       reply_to_message_id BIGINT,
       thread_id           BIGINT,
-      ts                  BIGINT, -- unix seconds
+      ts                  BIGINT,
       edited              BOOLEAN DEFAULT FALSE,
       deleted             BOOLEAN DEFAULT FALSE,
       extra               JSONB DEFAULT '{}'::jsonb,
-      PRIMARY KEY(chat_id, message_id)
-    );`);
+      PRIMARY KEY (chat_id, message_id)
+    );
+  `);
 
-  // FIX: без COALESCE в PRIMARY KEY (иначе синтакс. ошибка)
+  // FIX: без COALESCE в PK (ошибка в Postgres). Делаем user_id NOT NULL DEFAULT 0
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS reactions(
-      chat_id    BIGINT,
-      message_id BIGINT,
-      emoji      TEXT,
-      user_id    BIGINT,
+      chat_id    BIGINT NOT NULL,
+      message_id BIGINT NOT NULL,
+      emoji      TEXT   NOT NULL,
+      user_id    BIGINT NOT NULL DEFAULT 0,
       ts         BIGINT,
       PRIMARY KEY(chat_id, message_id, emoji, user_id)
-    );`);
+    );
+  `);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS posts_log(
@@ -176,7 +195,8 @@ export async function initSchema(){
       ts         BIGINT,
       status     TEXT,
       error      TEXT
-    );`);
+    );
+  `);
 
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS summaries(
@@ -185,14 +205,16 @@ export async function initSchema(){
       summary TEXT,
       period  TEXT DEFAULT 'last',
       PRIMARY KEY(chat_id, ts)
-    );`);
+    );
+  `);
 
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_messages_user_ts ON messages(user_id, ts DESC);`);
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_reactions_chat_msg ON reactions(chat_id, message_id);`);
 }
 
-export async function upsertUser(from = {}){
+// Upserts / helpers
+async function upsertUser(from={}){
   if (!pool || !from) return;
   await dbQuery(
     `INSERT INTO users(user_id, username, first_name, last_name, language_code)
@@ -206,7 +228,7 @@ export async function upsertUser(from = {}){
     [from.id, from.username || null, from.first_name || null, from.last_name || null, from.language_code || null]
   );
 }
-export async function upsertChat(chat = {}, rights = {}){
+async function upsertChat(chat={}, rights={}){
   if (!pool || !chat) return;
   await dbQuery(
     `INSERT INTO chats(chat_id, type, title, username, bot_can_post, bot_can_react)
@@ -221,7 +243,7 @@ export async function upsertChat(chat = {}, rights = {}){
     [chat.id, chat.type || null, chat.title || null, chat.username || null, rights?.can_post ?? false, rights?.can_react ?? true]
   );
 }
-export async function linkUserChannel(user_id, chat_id){
+async function linkUserChannel(user_id, chat_id){
   if (!pool) return;
   await dbQuery(
     `INSERT INTO user_channels(user_id, chat_id) VALUES ($1,$2)
@@ -229,7 +251,7 @@ export async function linkUserChannel(user_id, chat_id){
     [user_id, chat_id]
   );
 }
-export async function getUserChannels(user_id){
+async function getUserChannels(user_id){
   if (!pool) return [];
   const { rows } = await dbQuery(
     `SELECT uc.chat_id, c.title, c.username, c.type, c.bot_can_post
@@ -239,11 +261,11 @@ export async function getUserChannels(user_id){
   );
   return rows || [];
 }
-export async function storeMessageV2({
+async function storeMessageV2({
   chat_id, message_id, user_id = null,
-  role = 'user', content = '', media_type = 'text',
-  media_url = null, reply_to_message_id = null,
-  thread_id = null, ts = Math.floor(Date.now()/1000), extra = {}
+  role='user', content='', media_type='text',
+  media_url=null, reply_to_message_id=null,
+  thread_id=null, ts=Math.floor(Date.now()/1000), extra={}
 }){
   if (!pool) return;
   await dbQuery(
@@ -260,16 +282,17 @@ export async function storeMessageV2({
     [chat_id, message_id, user_id, role, content, media_type, media_url, reply_to_message_id, thread_id, ts, extra]
   );
 }
-export async function storeReaction({ chat_id, message_id, emoji = '👍', user_id = null, ts = Math.floor(Date.now()/1000) }){
+async function storeReaction({ chat_id, message_id, emoji='👍', user_id=null, ts=Math.floor(Date.now()/1000) }){
   if (!pool) return;
+  const uid = user_id ?? 0;
   await dbQuery(
     `INSERT INTO reactions(chat_id, message_id, emoji, user_id, ts)
      VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT DO NOTHING;`,
-    [chat_id, message_id, emoji, user_id, ts]
+     ON CONFLICT(chat_id, message_id, emoji, user_id) DO NOTHING;`,
+    [chat_id, message_id, emoji, uid, ts]
   );
 }
-export async function logPost({ chat_id, message_id = null, user_id = null, text = '', status = 'sent', error = null }){
+async function logPost({ chat_id, message_id=null, user_id=null, text='', status='sent', error=null }){
   if (!pool) return;
   await dbQuery(
     `INSERT INTO posts_log(chat_id, message_id, user_id, text, ts, status, error)
@@ -277,14 +300,14 @@ export async function logPost({ chat_id, message_id = null, user_id = null, text
     [chat_id, message_id, user_id, text, Math.floor(Date.now()/1000), status, error]
   );
 }
-export async function addSummary(chat_id, summary, period='last'){
+async function addSummary(chat_id, summary, period='last'){
   if (!pool) return;
   await dbQuery(
     `INSERT INTO summaries(chat_id, ts, summary, period) VALUES ($1,$2,$3,$4);`,
     [chat_id, Math.floor(Date.now()/1000), summary, period]
   );
 }
-export async function lastSummary(chat_id){
+async function lastSummary(chat_id){
   if (!pool) return '';
   const { rows } = await dbQuery(
     `SELECT summary FROM summaries WHERE chat_id=$1 ORDER BY ts DESC LIMIT 1;`,
@@ -293,7 +316,7 @@ export async function lastSummary(chat_id){
   return rows?.[0]?.summary || '';
 }
 
-// ---- роли/профиль пользователя ----
+// ============ роли/профиль ============
 const sessionRoles = new Map(); // user_id -> 'analyst'|'translator'|'coder'|null
 const ROLES = {
   analyst: 'Роль: аналитик. Делай структурированные выводы, риски и варианты.',
@@ -301,7 +324,7 @@ const ROLES = {
   coder: 'Роль: код-ассистент. Пиши код и объясняй шаги максимально ясно.'
 };
 async function getUserProfile(user_id){
-  const { rows } = await dbQuery('SELECT system_prompt FROM users WHERE user_id=$1',[user_id]);
+  const { rows } = await dbQuery('SELECT system_prompt FROM users WHERE user_id=$1', [user_id]);
   return rows?.[0]?.system_prompt || '';
 }
 async function setUserProfile(user_id, text){
@@ -312,37 +335,12 @@ async function setUserProfile(user_id, text){
   );
 }
 
-// ===== ПАТЧ №2: Сетевые утилиты (доступ в интернет) =====
-const DEFAULT_UA = 'Mozilla/5.0 (compatible; GPT-TelegramBot/1.0; +https://railway.app)';
-function abortableFetch(resource, options = {}, ms = 15000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
-  const headers = { 'User-Agent': DEFAULT_UA, ...(options.headers || {}) };
-  return fetch(resource, { ...options, headers, signal: controller.signal })
-    .finally(() => clearTimeout(id));
-}
-async function fetchText(url, ms = 15000) {
-  const r = await abortableFetch(url, {}, ms);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.text();
-}
-async function fetchJson(url, ms = 15000) {
-  const r = await abortableFetch(url, {}, ms);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
-async function fetchAndClean(url) {
-  const html = await fetchText(url, 20000);
-  const $ = load(html);
-  $('script,style,noscript').remove();
-  let text = $('body').text().replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
-  return text.slice(0, 60000);
-}
-
-// ===== NLU =====
+// ============ LLM utils ============
 async function sentiment(text){
   const r = await openai.chat.completions.create({
-    model: LLM_MODEL, temperature: 0, max_tokens: 4,
+    model: LLM_MODEL,
+    temperature: 0,
+    max_tokens: 4,
     messages: [{ role:'user', content:`Определи настроение (одно слово: позитив/нейтрально/негативно):\n${text}` }]
   });
   return (r.choices[0].message.content || 'нейтрально').toLowerCase();
@@ -359,29 +357,155 @@ async function buildMessages(ctx, userText){
   const msgs = [{ role:'system', content: sys }];
   const sum = await lastSummary(ctx.chat.id);
   if (sum) msgs.push({ role:'system', content:`Краткая память чата: ${sum}` });
+
   const arr = sessions.get(getKey(ctx)) || [];
   for (const m of arr) msgs.push(m);
   msgs.push({ role:'user', content: userText });
   return msgs;
 }
+async function makeLLMReply(ctx, userText){
+  const mood = await sentiment(userText);
+  const URL_RE = /https?:\/\/\S+/gi;
+  const urls = (userText.match(URL_RE) || []).slice(0, 3);
 
-// ===== команды =====
+  let addendum = '';
+  if (urls.length){
+    const parts = [];
+    for (const u of urls){
+      try {
+        const txt = await fetchAndClean(u);
+        parts.push(`[${u}] Содержание:\n${txt.slice(0, 3000)}`);
+      } catch (e) {
+        parts.push(`[${u}] не удалось получить (${e})`);
+      }
+    }
+    addendum = `\n\n---\nВложенные ссылки:\n${parts.join('\n\n')}`;
+  }
+  const msgs = await buildMessages(ctx, `Пользователь пишет (тон: ${mood}):\n${userText}${addendum}`);
+  const r = await openai.chat.completions.create({
+    model: LLM_MODEL, temperature: 0.6, max_tokens: 700, messages: msgs
+  });
+  return r.choices[0].message.content || '🤖';
+}
+async function replyAndStore(ctx, text, extra={}){
+  const m = await ctx.reply(text, { disable_web_page_preview:true, parse_mode:'Markdown', ...extra });
+  await storeMessageV2({ chat_id: ctx.chat.id, message_id: m.message_id, role:'assistant', content:text, media_type:'text' });
+  pushHistory(ctx, 'assistant', text);
+  appendChatLog(ctx, 'assistant', text);
+  return m;
+}
+async function reactToMessage(chat_id, message_id, emojis=['👍'], fromUserId=null){
+  const reaction = emojis.map(e => ({ type:'emoji', emoji:e }));
+  try {
+    await bot.telegram.callApi('setMessageReaction', { chat_id, message_id, reaction });
+  } catch (e) {
+    // если метод недоступен/нет прав — молчим, но логируем
+    console.warn('setMessageReaction failed:', e?.description || e?.message || e);
+  }
+  for (const e of emojis) await storeReaction({ chat_id, message_id, emoji:e, user_id:fromUserId });
+}
+
+// ============ SEARCH adapters ============
+async function braveSearch(q, limit=5){
+  if (!BRAVE_API_KEY) return null;
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${limit}`;
+  const r = await abortableFetch(url, { headers: { 'X-Subscription-Token': BRAVE_API_KEY } }, 15000);
+  if (!r.ok) throw new Error(`Brave HTTP ${r.status}`);
+  const data = await r.json();
+  const items = (data.web?.results || []).slice(0, limit).map(x => ({ title: x.title, url: x.url, snippet: x.description || '' }));
+  return items;
+}
+async function serpApiSearch(q, limit=5){
+  if (!SERPAPI_KEY) return null;
+  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(q)}&api_key=${SERPAPI_KEY}&num=${limit}`;
+  const data = await fetchJson(url, 15000);
+  const items = (data.organic_results || []).slice(0, limit).map(x => ({ title: x.title, url: x.link, snippet: x.snippet || '' }));
+  return items;
+}
+async function bingSearch(q, limit=5){
+  if (!BING_API_KEY) return null;
+  const url = `https://api.bing.microsoft.com/v7.0/search?q=${encodeURIComponent(q)}&count=${limit}`;
+  const r = await abortableFetch(url, { headers: { 'Ocp-Apim-Subscription-Key': BING_API_KEY } }, 15000);
+  if (!r.ok) throw new Error(`Bing HTTP ${r.status}`);
+  const data = await r.json();
+  const items = (data.webPages?.value || []).slice(0, limit).map(x => ({ title: x.name, url: x.url, snippet: x.snippet || '' }));
+  return items;
+}
+async function duckDuckGoSearch(q, limit=5){
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  const html = await fetchText(url, 15000);
+  const $ = load(html);
+  const out = [];
+  $('a.result__a').each((_, a) => {
+    if (out.length >= limit) return;
+    const title = $(a).text().trim();
+    const href  = $(a).attr('href');
+    if (href && title) out.push({ title, url: href, snippet: '' });
+  });
+  return out;
+}
+async function webSearch(query, limit=5){
+  const chain = [braveSearch, serpApiSearch, bingSearch, duckDuckGoSearch];
+  for (const fn of chain){
+    try {
+      const res = await fn(query, limit);
+      if (res && res.length) return res;
+    } catch (e) {
+      console.warn('Search adapter failed:', fn.name, e?.message || e);
+    }
+  }
+  return [];
+}
+async function makeWebAnswer(ctx, query, limit=5){
+  const results = await webSearch(query, limit);
+  if (!results.length) return { summary:'Ничего не нашлось.', sources:[] };
+
+  const toRead = results.slice(0, Math.min(results.length, 5));
+  const chunks = [];
+  for (const r of toRead){
+    try {
+      const txt = await fetchAndClean(r.url);
+      chunks.push({ ...r, text: txt.slice(0, 8000) });
+    } catch {
+      chunks.push({ ...r, text: '' });
+    }
+  }
+  const corpus = chunks.map((c,i)=>`#${i+1} ${c.title}\nURL: ${c.url}\nТекст (усеч.):\n${c.text || '(не удалось получить)'}`).join('\n\n---\n\n');
+
+  const prompt = `Ты — веб-помощник. По запросу пользователя выполни поиск и дай точный, краткий ответ с пунктами и выводом.
+Используй только факты из корпуса ниже. После ответа перечисли источники в формате [#N] Заголовок — URL.
+
+Запрос: ${query}
+
+Корпус:
+${corpus}`;
+
+  const r = await openai.chat.completions.create({
+    model: LLM_MODEL, temperature: 0.2, max_tokens: 700, messages: [{ role:'user', content: prompt }]
+  });
+  const summary = r.choices[0].message.content || '—';
+  const sources = results.map((r,i)=>({ n:i+1, title:r.title, url:r.url }));
+  return { summary, sources };
+}
+
+// ============ Команды ============
 bot.start(async (ctx)=>{
   await ctx.reply(
-    'Привет! Я GPT-бот с голосом, ссылками, фото и кратким резюме.\n' +
+    'Привет! Я GPT-бот с голосом, картинками, реакциями, памятью и онлайн-поиском.\n' +
     'Команды:\n' +
     '/reset — очистить контекст\n' +
     '/setprofile <текст> — персональный стиль ответов\n' +
     '/mode — выбрать роль (аналитик/переводчик/код-ассистент)\n' +
     '/summary — кратко перескажу последние сообщения\n' +
-    '/nettest — проверить соединение и доступ к интернету\n\n' +
+    '/post — опубликовать пост в привязанный канал\n' +
+    '/react — поставить реакцию (ответьте на сообщение)\n' +
+    '/linkchannel / unlinkchannel / mychannels — привязка каналов\n' +
+    '/digest — сделать дайджест канала\n' +
+    '/search <запрос> [N] — онлайн-поиск со сводкой\n\n' +
     'В группах отвечаю по упоминанию или reply.'
   );
 });
-bot.command('reset', async (ctx)=>{
-  sessions.delete(getKey(ctx));
-  await ctx.reply('Контекст очищён ✅');
-});
+bot.command('reset', async (ctx)=>{ sessions.delete(getKey(ctx)); await ctx.reply('Контекст очищён ✅'); });
 bot.command('setprofile', async (ctx)=>{
   const text = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
   if (!text) return ctx.reply('Укажите текст профиля: /setprofile ваш_стиль');
@@ -398,14 +522,9 @@ bot.command('mode', async (ctx)=>{
 });
 bot.action(/^mode:(.+)$/, async (ctx)=>{
   const v = ctx.match[1];
-  if (v === 'clear'){
-    sessionRoles.delete(ctx.from.id);
-    await ctx.answerCbQuery('Роль сброшена');
-    return ctx.editMessageText('Роль сброшена.');
-  }
+  if (v === 'clear'){ sessionRoles.delete(ctx.from.id); await ctx.answerCbQuery('Роль сброшена'); return ctx.editMessageText('Роль сброшена.'); }
   sessionRoles.set(ctx.from.id, v);
-  await ctx.answerCbQuery(`Роль: ${v}`);
-  await ctx.editMessageText(`Роль установлена: ${v}`);
+  await ctx.answerCbQuery(`Роль: ${v}`); await ctx.editMessageText(`Роль установлена: ${v}`);
 });
 bot.command('summary', async (ctx)=>{
   const arr = (chatLog.get(ctx.chat.id) || []).slice(-60);
@@ -419,137 +538,93 @@ bot.command('summary', async (ctx)=>{
   await ctx.reply(r.choices[0].message.content || '-', { disable_web_page_preview:true });
 });
 
-// --- новая команда: проверка интернета
-bot.command('nettest', async (ctx) => {
+// Каналы
+bot.command('linkchannel', async (ctx)=>{
   if (!ensurePrivate(ctx)) return;
-  try {
-    const htmlText = await fetchText('https://example.com/');
-    const ping = await fetchJson('https://api.ipify.org?format=json');
-    await ctx.reply(
-      `Интернет доступен ✅\nIP: ${ping.ip}\nСтраница example.com загружена (${htmlText.length} байт).`
-    );
-  } catch (e) {
-    await ctx.reply(`Нет доступа к сети или таймаут ❌\n${e?.message || e}`);
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Формат: /linkchannel @username_канала или ID');
+  try{
+    const chat = await ctx.telegram.getChat(arg);
+    if (chat.type !== 'channel') return ctx.reply('Это не канал.');
+    if (!(await botIsAdmin(chat.id, ctx.telegram))) return ctx.reply('Я не админ в канале. Дайте права.');
+    await upsertChat(chat, { can_post:true });
+    await upsertUser(ctx.from);
+    await linkUserChannel(ctx.from.id, chat.id);
+    await ctx.reply(`Канал привязан: ${chat.title || chat.username || chat.id}. Теперь можно: /post Текст поста`);
+  }catch{ await ctx.reply('Не удалось найти канал или нет прав.'); }
+});
+bot.command('mychannels', async (ctx)=>{
+  if (!ensurePrivate(ctx)) return;
+  const rows = await getUserChannels(ctx.from.id);
+  if (!rows.length) return ctx.reply('Нет привязанных каналов. Используйте /linkchannel @канал');
+  const list = rows.map((r,i)=>`${i+1}. ${r.title || r.username || r.chat_id}  ${r.bot_can_post ? '✅ постинг' : '⛔️'}`).join('\n');
+  await ctx.reply(`Ваши каналы:\n${list}`);
+});
+bot.command('unlinkchannel', async (ctx)=>{
+  if (!ensurePrivate(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Формат: /unlinkchannel @username_канала или ID');
+  try{
+    const chat = await ctx.telegram.getChat(arg);
+    await dbQuery(`DELETE FROM user_channels WHERE user_id=$1 AND chat_id=$2`, [ctx.from.id, chat.id]);
+    await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
+  }catch{ await ctx.reply('Не нашёл канал. Проверьте аргумент.'); }
+});
+bot.command('post', async (ctx)=>{
+  const raw = (ctx.message.text || '').slice(5).trim();
+  if (!raw) return ctx.reply('Формат: /post @канал Текст поста — или просто /post Текст (если привязан один канал)');
+  const parts = raw.split(/\s+/);
+  let chan = null, text = raw;
+  if (parts[0].startsWith('@') || /^\-?\d+$/.test(parts[0])) { chan = parts[0]; text = raw.slice(parts[0].length).trim(); }
+  let chatId = null;
+  if (chan){ try { const chat = await ctx.telegram.getChat(chan); chatId = chat.id; } catch {} }
+  else {
+    const list = await getUserChannels(ctx.from.id);
+    if (list.length === 1) chatId = list[0].chat_id;
+    else return ctx.reply('Несколько каналов привязано. Укажите: /post @канал Текст поста');
   }
+  if (!chatId) return ctx.reply('Не нашёл канал. Проверьте /mychannels или /linkchannel.');
+  try { await bot.telegram.sendChatAction(chatId, 'typing'); await replyAndStore(ctx, ''); } catch {}
+  try { await sendPostToChannel(chatId, text, ctx.from.id); await ctx.reply('Опубликовано ✅'); }
+  catch { await ctx.reply('Не удалось опубликовать. Дайте боту право Post Messages.'); }
+});
+bot.command('react', async (ctx)=>{
+  const emo = (ctx.message.text || '').split(' ')[1] || '👍';
+  const tgt = ctx.message?.reply_to_message;
+  if (!tgt) return ctx.reply('Ответьте на сообщение командой: /react 👍');
+  try { await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id); } catch {}
 });
 
-// ===== Handlers & helpers =====
-async function makeLLMReply(ctx, userText){
-  const mood = await sentiment(userText);
-  const URL_RE = /https?:\/\/\S+/gi;
-  const urls = (userText.match(URL_RE) || []).slice(0, 3);
+// Поиск
+bot.command('search', async (ctx)=>{
+  const rest = (ctx.message.text || '').split(' ').slice(1);
+  if (!rest.length) return ctx.reply('Формат: /search ваш_запрос [кол-во_ссылок]\nНапр.: /search курс доллара 5');
+  let limit = 5;
+  const last = rest[rest.length - 1];
+  if (/^\d+$/.test(last)) { limit = Math.max(3, Math.min(10, parseInt(last, 10))); rest.pop(); }
+  const query = rest.join(' ').trim();
 
-  let addendum = '';
-  if (urls.length){
-    const parts = [];
-    for (const u of urls){
-      try {
-        const txt = await fetchAndClean(u);
-        parts.push(`[${u}] Содержание:\n${txt.slice(0, 3000)}`);
-      } catch(e){
-        parts.push(`[${u}] не удалось получить (${e?.message || e})`);
-      }
-    }
-    addendum = `\n\n---\nВложенные ссылки:\n${parts.join('\n\n')}`;
-  }
-
-  const msgs = await buildMessages(ctx, `Пользователь пишет (тон: ${mood}):\n${userText}${addendum}`);
-  const r = await openai.chat.completions.create({
-    model: LLM_MODEL, temperature: 0.6, max_tokens: 700, messages: msgs
-  });
-  return r.choices[0].message.content || '🤖';
-}
-
-// === ПАТЧ №1 (продолжение): безопасная отправка с fallback
-async function replyAndStore(ctx, text, extra = {}){
-  try {
-    const m1 = await ctx.reply(text, {
-      disable_web_page_preview: true,
-      parse_mode: 'Markdown',
-      ...extra
-    });
-    await storeMessageV2({
-      chat_id: ctx.chat.id,
-      message_id: m1.message_id,
-      role: 'assistant',
-      content: text,
-      media_type: 'text'
-    });
-    pushHistory(ctx, 'assistant', text);
-    appendChatLog(ctx, 'assistant', text);
-    return m1;
-  } catch (e) {
-    const msg = (e?.response?.description || e?.message || '').toLowerCase();
-    if (msg.includes('parse entities') || msg.includes('parse mode') || msg.includes('bad request')) {
-      try {
-        const m2 = await ctx.reply(text, {
-          disable_web_page_preview: true,
-          ...extra // без parse_mode
-        });
-        await storeMessageV2({
-          chat_id: ctx.chat.id,
-          message_id: m2.message_id,
-          role: 'assistant',
-          content: text,
-          media_type: 'text'
-        });
-        pushHistory(ctx, 'assistant', text);
-        appendChatLog(ctx, 'assistant', text);
-        return m2;
-      } catch (e2) {
-        console.error('Fallback send failed:', e2?.response?.description || e2?.message || e2);
-      }
-    }
-    console.error('replyAndStore failed:', e?.response?.description || e?.message || e);
-  }
-}
-
-async function sendPostToChannel(chatId, text, requestedByUserId){
+  await ctx.sendChatAction('typing');
   try{
-    const msg = await bot.telegram.sendMessage(chatId, text, { disable_web_page_preview:false, parse_mode:'Markdown' });
-    await logPost({ chat_id: chatId, message_id: msg.message_id, user_id: requestedByUserId, text, status:'sent' });
-    await storeMessageV2({ chat_id: chatId, message_id: msg.message_id, role:'assistant', content:text, media_type:'text' });
-    return msg;
+    const { summary, sources } = await makeWebAnswer(ctx, query, limit);
+    const tail = sources.map(s => `[${s.n}] ${s.title}\n${s.url}`).join('\n');
+    await replyAndStore(ctx, `${summary}\n\nИсточники:\n${tail}`);
   }catch(e){
-    await logPost({ chat_id: chatId, message_id:null, user_id: requestedByUserId, text, status:'failed', error:String(e) });
-    throw e;
+    console.error('search error:', e);
+    await ctx.reply('Не удалось выполнить поиск сейчас. Попробуйте позже.');
   }
-}
+});
+bot.command('поиск', (ctx)=>{ ctx.update.message.text = ctx.update.message.text.replace(/^\/поиск/, '/search'); return bot.handleUpdate(ctx.update); });
 
-async function reactToMessage(chat_id, message_id, emojis=['👍'], fromUserId=null){
-  try {
-    const reaction = emojis.map(e => ({ type:'emoji', emoji:e }));
-    await bot.telegram.callApi('setMessageReaction', { chat_id, message_id, reaction });
-  } catch (e) {
-    console.error('setMessageReaction failed:', e?.response?.description || e?.message || e);
-    try {
-      for (const emoji of emojis) {
-        await bot.telegram.setMessageReaction(chat_id, message_id, [{ type:'emoji', emoji }]);
-      }
-    } catch (e2) {
-      console.error('fallback setMessageReaction failed:', e2?.response?.description || e2?.message || e2);
-    }
-  } finally {
-    for (const e of emojis) {
-      await storeReaction({ chat_id, message_id, emoji: e, user_id: fromUserId });
-    }
-  }
-}
-
-// ---------- TEXT ----------
+// ============ Хэндлеры контента ============
 bot.on('text', async (ctx)=>{
   await upsertUser(ctx.from);
   await upsertChat(ctx.chat);
 
   const m = ctx.message;
-
   await storeMessageV2({
-    chat_id: ctx.chat.id,
-    message_id: m.message_id,
-    user_id: ctx.from.id,
-    role: 'user',
-    content: m.text,
-    media_type: 'text',
+    chat_id: ctx.chat.id, message_id: m.message_id, user_id: ctx.from.id,
+    role:'user', content:m.text, media_type:'text',
     reply_to_message_id: m.reply_to_message?.message_id || null,
     thread_id: m.message_thread_id || null
   });
@@ -557,13 +632,11 @@ bot.on('text', async (ctx)=>{
   appendChatLog(ctx, 'user', m.text);
 
   if (!addressedToMe(ctx)) return;
-
   await ctx.sendChatAction('typing');
   const replyText = await makeLLMReply(ctx, m.text);
   await replyAndStore(ctx, replyText);
 });
 
-// ---------- PHOTO ----------
 bot.on('photo', async (ctx)=>{
   await upsertUser(ctx.from);
   await upsertChat(ctx.chat);
@@ -573,15 +646,9 @@ bot.on('photo', async (ctx)=>{
   const link = await ctx.telegram.getFileLink(fileId);
 
   await storeMessageV2({
-    chat_id: ctx.chat.id,
-    message_id: m.message_id,
-    user_id: ctx.from.id,
-    role: 'user',
-    content: m.caption || '',
-    media_type: 'photo',
-    media_url: link.href,
-    reply_to_message_id: m.reply_to_message?.message_id || null,
-    thread_id: m.message_thread_id || null
+    chat_id: ctx.chat.id, message_id: m.message_id, user_id: ctx.from.id,
+    role:'user', content: m.caption || '', media_type:'photo', media_url: link.href,
+    reply_to_message_id: m.reply_to_message?.message_id || null, thread_id: m.message_thread_id || null
   });
   pushHistory(ctx, 'user', '(image)');
   appendChatLog(ctx, 'user', '(image)');
@@ -590,8 +657,8 @@ bot.on('photo', async (ctx)=>{
 
   await ctx.sendChatAction('typing');
   const r = await openai.chat.completions.create({
-    model: LLM_MODEL, temperature:0.4,
-    messages: [{
+    model: LLM_MODEL, temperature: 0.4,
+    messages:[{
       role:'user',
       content:[
         { type:'text', text:'Опиши картинку и сделай выводы (если есть текст — выпиши кратко).' },
@@ -603,7 +670,6 @@ bot.on('photo', async (ctx)=>{
   await replyAndStore(ctx, replyText);
 });
 
-// ---------- VOICE ----------
 bot.on('voice', async (ctx)=>{
   await upsertUser(ctx.from);
   await upsertChat(ctx.chat);
@@ -612,15 +678,9 @@ bot.on('voice', async (ctx)=>{
   const link = await ctx.telegram.getFileLink(m.voice.file_id);
 
   await storeMessageV2({
-    chat_id: ctx.chat.id,
-    message_id: m.message_id,
-    user_id: ctx.from.id,
-    role: 'user',
-    content: '(voice)',
-    media_type: 'voice',
-    media_url: link.href,
-    reply_to_message_id: m.reply_to_message?.message_id || null,
-    thread_id: m.message_thread_id || null
+    chat_id: ctx.chat.id, message_id: m.message_id, user_id: ctx.from.id,
+    role:'user', content:'(voice)', media_type:'voice', media_url: link.href,
+    reply_to_message_id: m.reply_to_message?.message_id || null, thread_id: m.message_thread_id || null
   });
   pushHistory(ctx, 'user', '(voice)');
   appendChatLog(ctx, 'user', '(voice)');
@@ -635,7 +695,6 @@ bot.on('voice', async (ctx)=>{
   await replyAndStore(ctx, replyText);
 });
 
-// ---------- VIDEO NOTE ----------
 bot.on('video_note', async (ctx)=>{
   await upsertUser(ctx.from);
   await upsertChat(ctx.chat);
@@ -644,15 +703,9 @@ bot.on('video_note', async (ctx)=>{
   const link = await ctx.telegram.getFileLink(m.video_note.file_id);
 
   await storeMessageV2({
-    chat_id: ctx.chat.id,
-    message_id: m.message_id,
-    user_id: ctx.from.id,
-    role: 'user',
-    content: '(video_note)',
-    media_type: 'video_note',
-    media_url: link.href,
-    reply_to_message_id: m.reply_to_message?.message_id || null,
-    thread_id: m.message_thread_id || null
+    chat_id: ctx.chat.id, message_id: m.message_id, user_id: ctx.from.id,
+    role:'user', content:'(video_note)', media_type:'video_note', media_url: link.href,
+    reply_to_message_id: m.reply_to_message?.message_id || null, thread_id: m.message_thread_id || null
   });
   pushHistory(ctx, 'user', '(video_note)');
   appendChatLog(ctx, 'user', '(video_note)');
@@ -667,7 +720,7 @@ bot.on('video_note', async (ctx)=>{
   await replyAndStore(ctx, replyText);
 });
 
-// ---------- CHANNEL POSTS ----------
+// Канальные посты (для /digest и архива)
 bot.on('channel_post', async (ctx)=>{
   await upsertChat(ctx.chat, { can_post:true });
 
@@ -675,113 +728,58 @@ bot.on('channel_post', async (ctx)=>{
   const text = p.text || p.caption || '';
   let mediaUrl = null;
   let mediaType = 'text';
-
   if (p.photo?.length){
     mediaType = 'photo';
     mediaUrl = (await ctx.telegram.getFileLink(p.photo.at(-1).file_id)).href;
   }
 
   await storeMessageV2({
-    chat_id: ctx.chat.id,
-    message_id: p.message_id,
-    role: 'channel',
-    content: text,
-    media_type: mediaType,
-    media_url: mediaUrl,
-    thread_id: p.message_thread_id || null,
-    ts: p.date
+    chat_id: ctx.chat.id, message_id: p.message_id,
+    role:'channel', content:text, media_type:mediaType, media_url:mediaUrl,
+    thread_id: p.message_thread_id || null, ts: p.date
   });
 });
 
-// ---------- Доп. команды: постинг и реакции ----------
-bot.command('post', async (ctx)=>{
-  const raw = (ctx.message.text || '').slice(5).trim();
-  if (!raw) return ctx.reply('Формат: /post @канал Текст поста\nили: /post Текст (если привязан один канал)');
-  const parts = raw.split(/\s+/);
-  let chan = null, text = raw;
-  if (parts[0].startsWith('@') || /^\-?\d+$/.test(parts[0])) { chan = parts[0]; text = raw.slice(parts[0].length).trim(); }
-
-  let chatId = null;
-  if (chan){
-    try { const chat = await ctx.telegram.getChat(chan); chatId = chat.id; } catch {}
-  }else{
-    const list = await getUserChannels(ctx.from.id);
-    if (list.length === 1) chatId = list[0].chat_id;
-    else return ctx.reply('Несколько каналов привязано. Укажите: /post @канал Текст поста');
+// Дайджест канала
+bot.command('digest', async (ctx)=>{
+  if (!ensurePrivate(ctx)) return;
+  const parts = (ctx.message.text || '').split(/\s+/).slice(1);
+  if (!parts.length) return ctx.reply('Формат: /digest @канал 50 (по умолчанию 50)');
+  const target = parts[0];
+  const N = Math.max(5, Math.min(200, parseInt(parts[1] || '50', 10) || 50));
+  try{
+    const chat = await ctx.telegram.getChat(target);
+    if (chat.type !== 'channel') return ctx.reply('Укажите канал: @username или ID.');
+    const { rows } = await dbQuery(
+      `SELECT content, media_type FROM messages
+         WHERE chat_id=$1 AND role='channel' AND deleted=FALSE
+         ORDER BY ts DESC LIMIT $2`,
+      [chat.id, N]
+    );
+    if (!rows?.length) return ctx.reply('В базе нет постов этого канала. Добавьте бота в канал.');
+    const plain = rows.map((r,i)=>`${i+1}) [${r.media_type}] ${r.content || '(media)'}`).join('\n');
+    const prompt = `Сделай краткий дайджест канала. До 10 пунктов, по делу, без воды.
+Тексты постов (новые сверху):
+${plain}`;
+    const r = await openai.chat.completions.create({
+      model: LLM_MODEL, temperature: 0.3, max_tokens: 500, messages: [{ role:'user', content: prompt }]
+    });
+    await ctx.reply(r.choices[0].message.content || '—', { disable_web_page_preview:true });
+  }catch{
+    await ctx.reply('Ошибка. Проверьте @канал и что бот добавлен в канал.');
   }
-  if (!chatId) return ctx.reply('Не нашёл канал. Проверьте /mychannels или /linkchannel.');
-
-  try { await sendPostToChannel(chatId, text, ctx.from.id); await ctx.reply('Опубликовано ✅'); }
-  catch { await ctx.reply('Не удалось опубликовать. Нужны права Админа (Post Messages).'); }
 });
 
-bot.command('react', async (ctx)=>{
-  const emo = (ctx.message.text || '').split(' ')[1] || '👍';
-  const tgt = ctx.message?.reply_to_message;
-  if (!tgt) return ctx.reply('Ответьте на сообщение командой: /react 👍');
-  try { await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id); } catch {}
-});
-
-// ===== WEBHOOK & STARTUP =====
+// ============ Webhook ============
 app.use(bot.webhookCallback(WEBHOOK_SECRET_PATH));
 app.get('/', (_, res) => res.send('OK'));
 
 app.listen(PORT, async ()=>{
   console.log('HTTP server listening on port', PORT);
-  await initSchema(); // создаст таблицы, если есть DATABASE_URL
+  await initSchema();
   const url = `${PUBLIC_URL}${WEBHOOK_SECRET_PATH}`;
   await bot.telegram.setWebhook(url);
   const me = await bot.telegram.getMe();
   bot.options.username = me.username;
   console.log(`Bot @${me.username} webhook set to ${url}`);
-});
-
-// ===== Привязка каналов / список / отвязка (из лички) =====
-bot.command('linkchannel', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
-  if (!arg) return ctx.reply('Формат: /linkchannel @username_канала или числовой ID');
-
-  try {
-    const chat = await ctx.telegram.getChat(arg);
-    if (chat.type !== 'channel') {
-      return ctx.reply('Это не канал. Укажите @username или ID канала.');
-    }
-    const isAdmin = await botIsAdmin(chat.id, ctx.telegram);
-    if (!isAdmin) {
-      return ctx.reply('Я не админ в этом канале. Добавьте меня админом и повторите.');
-    }
-
-    await upsertChat(chat, { can_post: true });
-    await upsertUser(ctx.from);
-    await linkUserChannel(ctx.from.id, chat.id);
-
-    await ctx.reply(`Канал привязан: ${chat.title || chat.username || chat.id}\nТеперь можно: /post Текст поста`);
-  } catch (e) {
-    await ctx.reply('Не удалось найти канал или нет прав. Проверьте @username/ID и мои права администратора.');
-  }
-});
-
-bot.command('mychannels', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-  const rows = await getUserChannels(ctx.from.id);
-  if (!rows.length) return ctx.reply('Нет привязанных каналов. Используйте /linkchannel @канал');
-  const list = rows.map((r, i) =>
-    `${i+1}. ${r.title || r.username || r.chat_id}  ${r.bot_can_post ? '✅ постинг' : '⛔️'}`
-  ).join('\n');
-  await ctx.reply(`Ваши каналы:\n${list}`);
-});
-
-bot.command('unlinkchannel', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
-  if (!arg) return ctx.reply('Формат: /unlinkchannel @username_канала или ID');
-
-  try {
-    const chat = await ctx.telegram.getChat(arg);
-    await dbQuery(`DELETE FROM user_channels WHERE user_id=$1 AND chat_id=$2`, [ctx.from.id, chat.id]);
-    await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
-  } catch (e) {
-    await ctx.reply('Не нашёл канал. Проверьте аргумент.');
-  }
 });
