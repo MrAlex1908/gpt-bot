@@ -24,6 +24,22 @@ if (!PUBLIC_URL) throw new Error('PUBLIC_URL is required for webhooks');
 const openai = new OpenAI({ apiKey: OPENAI_KEY });
 const bot = new Telegraf(TG_TOKEN);
 
+// === ПАТЧ №1: глобальный перехват ошибок + обёртка ===
+bot.use(async (ctx, next) => {
+  try {
+    await next();
+  } catch (err) {
+    console.error('Middleware error:', err?.response?.description || err?.message || err, {
+      update: ctx.update
+    });
+  }
+});
+bot.catch((err, ctx) => {
+  console.error('Unhandled bot error:', err?.response?.description || err?.message || err, {
+    update: ctx.update
+  });
+});
+
 const app = express();
 app.use(express.json());
 
@@ -53,12 +69,10 @@ function addressedToMe(ctx){
   if (ctx.chat?.type === 'private') return true;
   const text = ctx.message?.text || '';
   const botUsername = ctx.me?.username || bot.options.username || '';
-  if (botUsername && text.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) return true;
+  if (botUsername && text?.toLowerCase().includes(`@${botUsername.toLowerCase()}`)) return true;
   if (ctx.message?.reply_to_message?.from?.is_bot) return true;
   return false;
 }
-
-// ===== helper: разрешаем команды только в ЛС =====
 function ensurePrivate(ctx) {
   if (ctx.chat?.type !== 'private') {
     ctx.reply('Эта команда работает только в личке. Напишите мне в ЛС.');
@@ -66,8 +80,6 @@ function ensurePrivate(ctx) {
   }
   return true;
 }
-
-// ===== helper: проверка, что бот админ в канале =====
 async function botIsAdmin(chatId, tg) {
   try {
     const admins = await tg.getChatAdministrators(chatId);
@@ -78,105 +90,7 @@ async function botIsAdmin(chatId, tg) {
   }
 }
 
-// ===== /linkchannel @канал_или_id =====
-bot.command('linkchannel', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
-  if (!arg) return ctx.reply('Формат: /linkchannel @username_канала или числовой ID');
-
-  try {
-    const chat = await ctx.telegram.getChat(arg);
-    if (chat.type !== 'channel') {
-      return ctx.reply('Это не канал. Укажите @username или ID канала.');
-    }
-    const isAdmin = await botIsAdmin(chat.id, ctx.telegram);
-    if (!isAdmin) {
-      return ctx.reply('Я не админ в этом канале. Добавьте меня админом и повторите.');
-    }
-
-    await upsertChat(chat, { can_post: true });
-    await upsertUser(ctx.from);
-    await linkUserChannel(ctx.from.id, chat.id);
-
-    await ctx.reply(`Канал привязан: ${chat.title || chat.username || chat.id}\nТеперь можно: /post Текст поста`);
-  } catch (e) {
-    await ctx.reply('Не удалось найти канал или нет прав. Проверьте @username/ID и мои права администратора.');
-  }
-});
-
-// ===== /mychannels =====
-bot.command('mychannels', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-  const rows = await getUserChannels(ctx.from.id);
-  if (!rows.length) return ctx.reply('Нет привязанных каналов. Используйте /linkchannel @канал');
-  const list = rows.map((r, i) =>
-    `${i+1}. ${r.title || r.username || r.chat_id}  ${r.bot_can_post ? '✅ постинг' : '⛔️'}`
-  ).join('\n');
-  await ctx.reply(`Ваши каналы:\n${list}`);
-});
-
-// ===== /unlinkchannel @канал_или_id =====
-bot.command('unlinkchannel', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
-  if (!arg) return ctx.reply('Формат: /unlinkchannel @username_канала или ID');
-
-  try {
-    const chat = await ctx.telegram.getChat(arg);
-    await dbQuery(`DELETE FROM user_channels WHERE user_id=$1 AND chat_id=$2`, [ctx.from.id, chat.id]);
-    await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
-  } catch (e) {
-    await ctx.reply('Не нашёл канал. Проверьте аргумент.');
-  }
-});
-
-// ===== /digest @канал [N] =====
-bot.command('digest', async (ctx) => {
-  if (!ensurePrivate(ctx)) return;
-
-  const parts = (ctx.message.text || '').split(/\s+/).slice(1);
-  if (!parts.length) return ctx.reply('Формат: /digest @канал 50  (по умолчанию N=50)');
-
-  const target = parts[0];
-  const N = Math.max(5, Math.min(200, parseInt(parts[1] || '50', 10) || 50));
-
-  try {
-    const chat = await ctx.telegram.getChat(target);
-    if (chat.type !== 'channel') return ctx.reply('Укажите именно канал: @username или ID.');
-
-    const { rows } = await dbQuery(
-      `SELECT content, media_type FROM messages
-         WHERE chat_id=$1 AND role='channel' AND deleted=FALSE
-         ORDER BY ts DESC LIMIT $2`,
-      [chat.id, N]
-    );
-
-    if (!rows?.length) {
-      return ctx.reply('В базе нет постов этого канала (добавьте бота в канал, чтобы он видел посты).');
-    }
-
-    const plain = rows
-      .map((r, i) => `${i+1}) [${r.media_type}] ${r.content || '(media)'}`)
-      .join('\n');
-
-    const prompt = `Сделай краткий дайджест канала. До 10 пунктов, по делу, без воды.
-Тексты постов (новые сверху):
-${plain}`;
-
-    const r = await openai.chat.completions.create({
-      model: LLM_MODEL,
-      temperature: 0.3,
-      max_tokens: 500,
-      messages: [{ role: 'user', content: prompt }]
-    });
-
-    await ctx.reply(r.choices[0].message.content || '—', { disable_web_page_preview: true });
-  } catch (e) {
-    await ctx.reply('Ошибка. Проверьте @канал и что бот добавлен в канал.');
-  }
-});
-
-// ---------- DB (v2) ----------
+// ---------- DB ----------
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 
 async function dbQuery(q, params = []){
@@ -241,13 +155,13 @@ export async function initSchema(){
       PRIMARY KEY(chat_id, message_id)
     );`);
 
-  // ✅ FIXED: без COALESCE в PK
+  // FIX: без COALESCE в PRIMARY KEY (иначе синтакс. ошибка)
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS reactions(
-      chat_id    BIGINT NOT NULL,
-      message_id BIGINT NOT NULL,
-      emoji      TEXT   NOT NULL,
-      user_id    BIGINT NOT NULL DEFAULT 0,
+      chat_id    BIGINT,
+      message_id BIGINT,
+      emoji      TEXT,
+      user_id    BIGINT,
       ts         BIGINT,
       PRIMARY KEY(chat_id, message_id, emoji, user_id)
     );`);
@@ -278,7 +192,6 @@ export async function initSchema(){
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_reactions_chat_msg ON reactions(chat_id, message_id);`);
 }
 
-// апсерты/утилиты БД
 export async function upsertUser(from = {}){
   if (!pool || !from) return;
   await dbQuery(
@@ -347,15 +260,13 @@ export async function storeMessageV2({
     [chat_id, message_id, user_id, role, content, media_type, media_url, reply_to_message_id, thread_id, ts, extra]
   );
 }
-export async function storeReaction({
-  chat_id, message_id, emoji = '👍', user_id = null, ts = Math.floor(Date.now()/1000)
-}){
+export async function storeReaction({ chat_id, message_id, emoji = '👍', user_id = null, ts = Math.floor(Date.now()/1000) }){
   if (!pool) return;
   await dbQuery(
     `INSERT INTO reactions(chat_id, message_id, emoji, user_id, ts)
      VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT(chat_id, message_id, emoji, user_id) DO NOTHING;`,
-    [chat_id, message_id, emoji, (user_id ?? 0), ts]
+     ON CONFLICT DO NOTHING;`,
+    [chat_id, message_id, emoji, user_id, ts]
   );
 }
 export async function logPost({ chat_id, message_id = null, user_id = null, text = '', status = 'sent', error = null }){
@@ -401,15 +312,34 @@ async function setUserProfile(user_id, text){
   );
 }
 
-// ===== вспомогательные утилиты =====
-async function fetchAndClean(url){
-  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-  const html = await res.text();
+// ===== ПАТЧ №2: Сетевые утилиты (доступ в интернет) =====
+const DEFAULT_UA = 'Mozilla/5.0 (compatible; GPT-TelegramBot/1.0; +https://railway.app)';
+function abortableFetch(resource, options = {}, ms = 15000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  const headers = { 'User-Agent': DEFAULT_UA, ...(options.headers || {}) };
+  return fetch(resource, { ...options, headers, signal: controller.signal })
+    .finally(() => clearTimeout(id));
+}
+async function fetchText(url, ms = 15000) {
+  const r = await abortableFetch(url, {}, ms);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.text();
+}
+async function fetchJson(url, ms = 15000) {
+  const r = await abortableFetch(url, {}, ms);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+async function fetchAndClean(url) {
+  const html = await fetchText(url, 20000);
   const $ = load(html);
   $('script,style,noscript').remove();
   let text = $('body').text().replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
   return text.slice(0, 60000);
 }
+
+// ===== NLU =====
 async function sentiment(text){
   const r = await openai.chat.completions.create({
     model: LLM_MODEL, temperature: 0, max_tokens: 4,
@@ -443,7 +373,8 @@ bot.start(async (ctx)=>{
     '/reset — очистить контекст\n' +
     '/setprofile <текст> — персональный стиль ответов\n' +
     '/mode — выбрать роль (аналитик/переводчик/код-ассистент)\n' +
-    '/summary — кратко перескажу последние сообщения\n\n' +
+    '/summary — кратко перескажу последние сообщения\n' +
+    '/nettest — проверить соединение и доступ к интернету\n\n' +
     'В группах отвечаю по упоминанию или reply.'
   );
 });
@@ -488,7 +419,21 @@ bot.command('summary', async (ctx)=>{
   await ctx.reply(r.choices[0].message.content || '-', { disable_web_page_preview:true });
 });
 
-// ===== Handlers & helpers (Block B, unified) =====
+// --- новая команда: проверка интернета
+bot.command('nettest', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  try {
+    const htmlText = await fetchText('https://example.com/');
+    const ping = await fetchJson('https://api.ipify.org?format=json');
+    await ctx.reply(
+      `Интернет доступен ✅\nIP: ${ping.ip}\nСтраница example.com загружена (${htmlText.length} байт).`
+    );
+  } catch (e) {
+    await ctx.reply(`Нет доступа к сети или таймаут ❌\n${e?.message || e}`);
+  }
+});
+
+// ===== Handlers & helpers =====
 async function makeLLMReply(ctx, userText){
   const mood = await sentiment(userText);
   const URL_RE = /https?:\/\/\S+/gi;
@@ -502,7 +447,7 @@ async function makeLLMReply(ctx, userText){
         const txt = await fetchAndClean(u);
         parts.push(`[${u}] Содержание:\n${txt.slice(0, 3000)}`);
       } catch(e){
-        parts.push(`[${u}] не удалось получить (${e})`);
+        parts.push(`[${u}] не удалось получить (${e?.message || e})`);
       }
     }
     addendum = `\n\n---\nВложенные ссылки:\n${parts.join('\n\n')}`;
@@ -515,12 +460,48 @@ async function makeLLMReply(ctx, userText){
   return r.choices[0].message.content || '🤖';
 }
 
-async function replyAndStore(ctx, text, extra={}){
-  const m = await ctx.reply(text, { disable_web_page_preview:true, parse_mode:'Markdown', ...extra });
-  await storeMessageV2({ chat_id: ctx.chat.id, message_id: m.message_id, role:'assistant', content:text, media_type:'text' });
-  pushHistory(ctx, 'assistant', text);
-  appendChatLog(ctx, 'assistant', text);
-  return m;
+// === ПАТЧ №1 (продолжение): безопасная отправка с fallback
+async function replyAndStore(ctx, text, extra = {}){
+  try {
+    const m1 = await ctx.reply(text, {
+      disable_web_page_preview: true,
+      parse_mode: 'Markdown',
+      ...extra
+    });
+    await storeMessageV2({
+      chat_id: ctx.chat.id,
+      message_id: m1.message_id,
+      role: 'assistant',
+      content: text,
+      media_type: 'text'
+    });
+    pushHistory(ctx, 'assistant', text);
+    appendChatLog(ctx, 'assistant', text);
+    return m1;
+  } catch (e) {
+    const msg = (e?.response?.description || e?.message || '').toLowerCase();
+    if (msg.includes('parse entities') || msg.includes('parse mode') || msg.includes('bad request')) {
+      try {
+        const m2 = await ctx.reply(text, {
+          disable_web_page_preview: true,
+          ...extra // без parse_mode
+        });
+        await storeMessageV2({
+          chat_id: ctx.chat.id,
+          message_id: m2.message_id,
+          role: 'assistant',
+          content: text,
+          media_type: 'text'
+        });
+        pushHistory(ctx, 'assistant', text);
+        appendChatLog(ctx, 'assistant', text);
+        return m2;
+      } catch (e2) {
+        console.error('Fallback send failed:', e2?.response?.description || e2?.message || e2);
+      }
+    }
+    console.error('replyAndStore failed:', e?.response?.description || e?.message || e);
+  }
 }
 
 async function sendPostToChannel(chatId, text, requestedByUserId){
@@ -535,33 +516,24 @@ async function sendPostToChannel(chatId, text, requestedByUserId){
   }
 }
 
-// ====== PATCHED reactions with fallback + logging ======
 async function reactToMessage(chat_id, message_id, emojis=['👍'], fromUserId=null){
-  const reactionObjects = emojis.map(e => ({ type:'emoji', emoji:e }));
-
   try {
-    await bot.telegram.callApi('setMessageReaction', {
-      chat_id,
-      message_id,
-      reaction: reactionObjects,
-      is_big: false
-    });
-  } catch (err1) {
-    console.error('setMessageReaction failed (v1 payload):', err1?.response?.description || err1?.message || err1);
+    const reaction = emojis.map(e => ({ type:'emoji', emoji:e }));
+    await bot.telegram.callApi('setMessageReaction', { chat_id, message_id, reaction });
+  } catch (e) {
+    console.error('setMessageReaction failed:', e?.response?.description || e?.message || e);
     try {
-      await bot.telegram.callApi('setMessageReaction', {
-        chat_id,
-        message_id,
-        reaction: emojis, // fallback to array of strings
-        is_big: false
-      });
-    } catch (err2) {
-      console.error('setMessageReaction failed (fallback payload):', err2?.response?.description || err2?.message || err2);
-      throw err2;
+      for (const emoji of emojis) {
+        await bot.telegram.setMessageReaction(chat_id, message_id, [{ type:'emoji', emoji }]);
+      }
+    } catch (e2) {
+      console.error('fallback setMessageReaction failed:', e2?.response?.description || e2?.message || e2);
+    }
+  } finally {
+    for (const e of emojis) {
+      await storeReaction({ chat_id, message_id, emoji: e, user_id: fromUserId });
     }
   }
-
-  for (const e of emojis) await storeReaction({ chat_id, message_id, emoji:e, user_id:(fromUserId ?? 0) });
 }
 
 // ---------- TEXT ----------
@@ -721,7 +693,7 @@ bot.on('channel_post', async (ctx)=>{
   });
 });
 
-// ---------- OPTIONAL: react & post ----------
+// ---------- Доп. команды: постинг и реакции ----------
 bot.command('post', async (ctx)=>{
   const raw = (ctx.message.text || '').slice(5).trim();
   if (!raw) return ctx.reply('Формат: /post @канал Текст поста\nили: /post Текст (если привязан один канал)');
@@ -740,28 +712,14 @@ bot.command('post', async (ctx)=>{
   if (!chatId) return ctx.reply('Не нашёл канал. Проверьте /mychannels или /linkchannel.');
 
   try { await sendPostToChannel(chatId, text, ctx.from.id); await ctx.reply('Опубликовано ✅'); }
-  catch { await ctx.reply('Не удалось опубликовать. Дайте боту права Админа (Post Messages).'); }
+  catch { await ctx.reply('Не удалось опубликовать. Нужны права Админа (Post Messages).'); }
 });
 
 bot.command('react', async (ctx)=>{
-  const parts = (ctx.message.text || '').trim().split(/\s+/);
-  const emo = parts[1] || '👍';
+  const emo = (ctx.message.text || '').split(' ')[1] || '👍';
   const tgt = ctx.message?.reply_to_message;
   if (!tgt) return ctx.reply('Ответьте на сообщение командой: /react 👍');
-
-  try {
-    await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id);
-    await ctx.reply(`Поставил реакцию ${emo} ✅`, { reply_to_message_id: tgt.message_id });
-  } catch (e) {
-    const reason = (e?.response?.description || e?.message || '').toLowerCase();
-    if (reason.includes('not supported') || reason.includes('reaction')) {
-      return ctx.reply('Не удалось: кажется, в этом чате/канале выключены реакции или Telegram их здесь не поддерживает.');
-    }
-    if (reason.includes('not enough rights') || reason.includes('admin')) {
-      return ctx.reply('Не удалось: у меня нет прав. Сделай меня админом и включи реакции в настройках чата/канала.');
-    }
-    return ctx.reply('Не удалось поставить реакцию. Проверь, что реакции включены и у меня есть права.');
-  }
+  try { await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id); } catch {}
 });
 
 // ===== WEBHOOK & STARTUP =====
@@ -770,32 +728,60 @@ app.get('/', (_, res) => res.send('OK'));
 
 app.listen(PORT, async ()=>{
   console.log('HTTP server listening on port', PORT);
-  console.log('BOT BUILD:', '2025-10-05-reactions-v3'); // build-маячок
-
   await initSchema(); // создаст таблицы, если есть DATABASE_URL
-
   const url = `${PUBLIC_URL}${WEBHOOK_SECRET_PATH}`;
-
-  // сбрасываем старый вебхук (на случай смены URL)
-  try { await bot.telegram.deleteWebhook({ drop_pending_updates: false }); } catch {}
-
   await bot.telegram.setWebhook(url);
   const me = await bot.telegram.getMe();
   bot.options.username = me.username;
-
-  // обновим меню команд
-  await bot.telegram.setMyCommands([
-    { command: 'summary',       description: 'Дай краткое резюме чата' },
-    { command: 'setprofile',    description: 'Задать стиль ответов' },
-    { command: 'mode',          description: 'Выбрать режим ответа' },
-    { command: 'linkchannel',   description: 'Привязать канал к себе' },
-    { command: 'mychannels',    description: 'Мои привязанные каналы' },
-    { command: 'unlinkchannel', description: 'Отвязать канал' },
-    { command: 'post',          description: 'Опубликовать пост в канал' },
-    { command: 'digest',        description: 'Дайджест постов канала' },
-    { command: 'react',         description: 'Поставить реакцию по reply' },
-    { command: 'reset',         description: 'Очистить контекст диалога' }
-  ]);
-
   console.log(`Bot @${me.username} webhook set to ${url}`);
+});
+
+// ===== Привязка каналов / список / отвязка (из лички) =====
+bot.command('linkchannel', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Формат: /linkchannel @username_канала или числовой ID');
+
+  try {
+    const chat = await ctx.telegram.getChat(arg);
+    if (chat.type !== 'channel') {
+      return ctx.reply('Это не канал. Укажите @username или ID канала.');
+    }
+    const isAdmin = await botIsAdmin(chat.id, ctx.telegram);
+    if (!isAdmin) {
+      return ctx.reply('Я не админ в этом канале. Добавьте меня админом и повторите.');
+    }
+
+    await upsertChat(chat, { can_post: true });
+    await upsertUser(ctx.from);
+    await linkUserChannel(ctx.from.id, chat.id);
+
+    await ctx.reply(`Канал привязан: ${chat.title || chat.username || chat.id}\nТеперь можно: /post Текст поста`);
+  } catch (e) {
+    await ctx.reply('Не удалось найти канал или нет прав. Проверьте @username/ID и мои права администратора.');
+  }
+});
+
+bot.command('mychannels', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  const rows = await getUserChannels(ctx.from.id);
+  if (!rows.length) return ctx.reply('Нет привязанных каналов. Используйте /linkchannel @канал');
+  const list = rows.map((r, i) =>
+    `${i+1}. ${r.title || r.username || r.chat_id}  ${r.bot_can_post ? '✅ постинг' : '⛔️'}`
+  ).join('\n');
+  await ctx.reply(`Ваши каналы:\n${list}`);
+});
+
+bot.command('unlinkchannel', async (ctx) => {
+  if (!ensurePrivate(ctx)) return;
+  const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
+  if (!arg) return ctx.reply('Формат: /unlinkchannel @username_канала или ID');
+
+  try {
+    const chat = await ctx.telegram.getChat(arg);
+    await dbQuery(`DELETE FROM user_channels WHERE user_id=$1 AND chat_id=$2`, [ctx.from.id, chat.id]);
+    await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
+  } catch (e) {
+    await ctx.reply('Не нашёл канал. Проверьте аргумент.');
+  }
 });
