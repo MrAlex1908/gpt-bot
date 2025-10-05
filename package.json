@@ -1,8 +1,9 @@
 {
   "name": "gpt-telegram-bot",
   "version": "1.0.0",
-  "type": "module",
+  "description": "GPT Telegram Bot with OpenAI and voice/link support, deployed on Railway",
   "main": "index.mjs",
+  "type": "module",
   "scripts": {
     "start": "node index.mjs"
   },
@@ -11,7 +12,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "openai": "^4.57.0",
-    "pg": "^8.16.3",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "pg": "^8.12.0"
   }
 }
