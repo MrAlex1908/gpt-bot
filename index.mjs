@@ -17,7 +17,7 @@ const WEBHOOK_SECRET_PATH = RAW_WEBHOOK.startsWith('/') ? RAW_WEBHOOK : `/${RAW_
 const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL || null;
 
-// Online search providers (optional)
+// (опционально) провайдеры поиска
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
 const SERPAPI_KEY   = process.env.SERPAPI_KEY   || '';
 const BING_API_KEY  = process.env.BING_API_KEY  || '';
@@ -71,13 +71,6 @@ function ensurePrivate(ctx){
   }
   return true;
 }
-async function botIsAdmin(chatId, tg){
-  try{
-    const admins = await tg.getChatAdministrators(chatId);
-    const me = await tg.getMe();
-    return admins.some(a => a.user.id === me.id);
-  }catch{ return false; }
-}
 
 // ============ HTTP helpers ============
 function abortableFetch(url, options={}, ms=15000){
@@ -86,7 +79,11 @@ function abortableFetch(url, options={}, ms=15000){
   return fetch(url, { ...options, signal: ctrl.signal }).finally(() => clearTimeout(id));
 }
 async function fetchText(url, ms=15000){
-  const r = await abortableFetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, ms);
+  const r = await abortableFetch(
+    url,
+    { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36' } },
+    ms
+  );
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.text();
 }
@@ -95,15 +92,26 @@ async function fetchJson(url, ms=15000){
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.json();
 }
+
+// читает и чистит страницу; если не получилось — использует r.jina.ai как «ридер»
 async function fetchAndClean(url){
-  const html = await fetchText(url, 15000);
-  const $ = load(html);
-  $('script,style,noscript').remove();
-  let text = $('body').text().replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
-  return text.slice(0, 60000);
+  try {
+    const html = await fetchText(url, 15000);
+    const $ = load(html);
+    $('script,style,noscript').remove();
+    let text = $('body').text().replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim();
+    if (text) return text.slice(0, 60000);
+  } catch {}
+  // fallback reader
+  try {
+    const reader = `https://r.jina.ai/http://${url.replace(/^https?:\/\//,'')}`;
+    const txt = await fetchText(reader, 15000);
+    return txt.slice(0, 60000);
+  } catch {}
+  return '';
 }
 
-// ============ DB (v2) ============
+// ============ DB ============
 const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL }) : null;
 
 async function dbQuery(q, params=[]){
@@ -173,7 +181,7 @@ async function initSchema(){
     );
   `);
 
-  // FIX: без COALESCE в PK (ошибка в Postgres). Делаем user_id NOT NULL DEFAULT 0
+  // исправление: user_id в PK реакций теперь NOT NULL DEFAULT 0, без COALESCE
   await dbQuery(`
     CREATE TABLE IF NOT EXISTS reactions(
       chat_id    BIGINT NOT NULL,
@@ -213,7 +221,6 @@ async function initSchema(){
   await dbQuery(`CREATE INDEX IF NOT EXISTS idx_reactions_chat_msg ON reactions(chat_id, message_id);`);
 }
 
-// Upserts / helpers
 async function upsertUser(from={}){
   if (!pool || !from) return;
   await dbQuery(
@@ -316,8 +323,8 @@ async function lastSummary(chat_id){
   return rows?.[0]?.summary || '';
 }
 
-// ============ роли/профиль ============
-const sessionRoles = new Map(); // user_id -> 'analyst'|'translator'|'coder'|null
+// ============ LLM utils ============
+const sessionRoles = new Map();
 const ROLES = {
   analyst: 'Роль: аналитик. Делай структурированные выводы, риски и варианты.',
   translator: 'Роль: переводчик. Переводи кратко и точно, указывай язык оригинала.',
@@ -334,8 +341,6 @@ async function setUserProfile(user_id, text){
     [user_id, text]
   );
 }
-
-// ============ LLM utils ============
 async function sentiment(text){
   const r = await openai.chat.completions.create({
     model: LLM_MODEL,
@@ -399,13 +404,13 @@ async function reactToMessage(chat_id, message_id, emojis=['👍'], fromUserId=n
   try {
     await bot.telegram.callApi('setMessageReaction', { chat_id, message_id, reaction });
   } catch (e) {
-    // если метод недоступен/нет прав — молчим, но логируем
     console.warn('setMessageReaction failed:', e?.description || e?.message || e);
   }
   for (const e of emojis) await storeReaction({ chat_id, message_id, emoji:e, user_id:fromUserId });
 }
 
 // ============ SEARCH adapters ============
+// 1) Brave
 async function braveSearch(q, limit=5){
   if (!BRAVE_API_KEY) return null;
   const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${limit}`;
@@ -415,6 +420,7 @@ async function braveSearch(q, limit=5){
   const items = (data.web?.results || []).slice(0, limit).map(x => ({ title: x.title, url: x.url, snippet: x.description || '' }));
   return items;
 }
+// 2) SerpAPI (Google)
 async function serpApiSearch(q, limit=5){
   if (!SERPAPI_KEY) return null;
   const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(q)}&api_key=${SERPAPI_KEY}&num=${limit}`;
@@ -422,6 +428,7 @@ async function serpApiSearch(q, limit=5){
   const items = (data.organic_results || []).slice(0, limit).map(x => ({ title: x.title, url: x.link, snippet: x.snippet || '' }));
   return items;
 }
+// 3) Bing
 async function bingSearch(q, limit=5){
   if (!BING_API_KEY) return null;
   const url = `https://api.bing.microsoft.com/v7.0/search?q=${encodeURIComponent(q)}&count=${limit}`;
@@ -431,19 +438,33 @@ async function bingSearch(q, limit=5){
   const items = (data.webPages?.value || []).slice(0, limit).map(x => ({ title: x.name, url: x.url, snippet: x.snippet || '' }));
   return items;
 }
+// 4) DuckDuckGo HTML (надёжный бэкап без ключей)
+function decodeDuckHref(href){
+  try{
+    // формат: /l/?kh=-1&uddg=<urlenc(realUrl)>
+    const u = new URL('https://duckduckgo.com' + href);
+    const uddg = u.searchParams.get('uddg');
+    return uddg ? decodeURIComponent(uddg) : href;
+  }catch{ return href; }
+}
 async function duckDuckGoSearch(q, limit=5){
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  // важный момент: используем основной домен, а не html.duckduckgo.com
+  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
   const html = await fetchText(url, 15000);
   const $ = load(html);
   const out = [];
   $('a.result__a').each((_, a) => {
     if (out.length >= limit) return;
     const title = $(a).text().trim();
-    const href  = $(a).attr('href');
-    if (href && title) out.push({ title, url: href, snippet: '' });
+    let href  = $(a).attr('href');
+    if (!href || !title) return;
+    href = decodeDuckHref(href);
+    // иногда DDG выдаёт относительную ссылку на сам duckduckgo.com — пропустим такие
+    if (/^https?:\/\//i.test(href)) out.push({ title, url: href, snippet: '' });
   });
   return out;
 }
+
 async function webSearch(query, limit=5){
   const chain = [braveSearch, serpApiSearch, bingSearch, duckDuckGoSearch];
   for (const fn of chain){
@@ -456,6 +477,7 @@ async function webSearch(query, limit=5){
   }
   return [];
 }
+
 async function makeWebAnswer(ctx, query, limit=5){
   const results = await webSearch(query, limit);
   if (!results.length) return { summary:'Ничего не нашлось.', sources:[] };
@@ -538,7 +560,14 @@ bot.command('summary', async (ctx)=>{
   await ctx.reply(r.choices[0].message.content || '-', { disable_web_page_preview:true });
 });
 
-// Каналы
+// привязка каналов
+async function botIsAdmin(chatId, tg){
+  try{
+    const admins = await tg.getChatAdministrators(chatId);
+    const me = await tg.getMe();
+    return admins.some(a => a.user.id === me.id);
+  }catch{ return false; }
+}
 bot.command('linkchannel', async (ctx)=>{
   if (!ensurePrivate(ctx)) return;
   const arg = (ctx.message.text || '').split(' ').slice(1).join(' ').trim();
@@ -570,6 +599,19 @@ bot.command('unlinkchannel', async (ctx)=>{
     await ctx.reply(`Канал отвязан: ${chat.title || chat.username || chat.id}`);
   }catch{ await ctx.reply('Не нашёл канал. Проверьте аргумент.'); }
 });
+
+// публикация
+async function sendPostToChannel(chatId, text, requestedByUserId){
+  try{
+    const msg = await bot.telegram.sendMessage(chatId, text, { disable_web_page_preview:false, parse_mode:'Markdown' });
+    await logPost({ chat_id: chatId, message_id: msg.message_id, user_id: requestedByUserId, text, status:'sent' });
+    await storeMessageV2({ chat_id: chatId, message_id: msg.message_id, role:'assistant', content:text, media_type:'text' });
+    return msg;
+  }catch(e){
+    await logPost({ chat_id: chatId, message_id:null, user_id: requestedByUserId, text, status:'failed', error:String(e) });
+    throw e;
+  }
+}
 bot.command('post', async (ctx)=>{
   const raw = (ctx.message.text || '').slice(5).trim();
   if (!raw) return ctx.reply('Формат: /post @канал Текст поста — или просто /post Текст (если привязан один канал)');
@@ -584,10 +626,11 @@ bot.command('post', async (ctx)=>{
     else return ctx.reply('Несколько каналов привязано. Укажите: /post @канал Текст поста');
   }
   if (!chatId) return ctx.reply('Не нашёл канал. Проверьте /mychannels или /linkchannel.');
-  try { await bot.telegram.sendChatAction(chatId, 'typing'); await replyAndStore(ctx, ''); } catch {}
   try { await sendPostToChannel(chatId, text, ctx.from.id); await ctx.reply('Опубликовано ✅'); }
   catch { await ctx.reply('Не удалось опубликовать. Дайте боту право Post Messages.'); }
 });
+
+// реакции
 bot.command('react', async (ctx)=>{
   const emo = (ctx.message.text || '').split(' ')[1] || '👍';
   const tgt = ctx.message?.reply_to_message;
@@ -595,7 +638,7 @@ bot.command('react', async (ctx)=>{
   try { await reactToMessage(ctx.chat.id, tgt.message_id, [emo], ctx.from.id); } catch {}
 });
 
-// Поиск
+// поиск
 bot.command('search', async (ctx)=>{
   const rest = (ctx.message.text || '').split(' ').slice(1);
   if (!rest.length) return ctx.reply('Формат: /search ваш_запрос [кол-во_ссылок]\nНапр.: /search курс доллара 5');
@@ -720,7 +763,7 @@ bot.on('video_note', async (ctx)=>{
   await replyAndStore(ctx, replyText);
 });
 
-// Канальные посты (для /digest и архива)
+// канал-посты (для /digest)
 bot.on('channel_post', async (ctx)=>{
   await upsertChat(ctx.chat, { can_post:true });
 
@@ -740,7 +783,7 @@ bot.on('channel_post', async (ctx)=>{
   });
 });
 
-// Дайджест канала
+// дайджест канала
 bot.command('digest', async (ctx)=>{
   if (!ensurePrivate(ctx)) return;
   const parts = (ctx.message.text || '').split(/\s+/).slice(1);
